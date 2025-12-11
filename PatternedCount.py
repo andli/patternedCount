@@ -4,18 +4,21 @@
 # Usage:
 # 1. Create user parameters:
 #    - pcSegmentCount   (unitless int, e.g. 10)
-#    - pcSegmentPitch   (length, e.g. 6 mm)
+#    - pcSegmentPitch   (length, e.g. 6 mm) - for linear mode
 #    - pcStartNumber    (unitless int, e.g. 0)
-#    - pcDirection      (text: "+X", "-X", "+Y", "-Y"; optional, default "+X")
+#    - pcDirection      (text: "+X", "-X", "+Y", "-Y"; optional, default "+X") - for linear mode
+#    - pcArcDirection   (text: "CW" or "CCW"; optional, default "CCW") - for circular mode
 #    - pcCutDepth       (length, e.g. 0.4 mm; optional - enables cut/body creation)
 #
 # 2. Create a sketch on a face, add ONE Sketch Text as the template.
+#    - For circular mode: include a circle in the sketch (the text will follow it)
 # 3. Select the sketch in the browser (or edit it).
 # 4. Run this script from Scripts & Add-Ins.
 
 import adsk.core
 import adsk.fusion
 import traceback
+import math
 
 # Prefix for generated features - only items with this prefix will be auto-deleted
 GENERATED_PREFIX = "pc#"
@@ -34,12 +37,25 @@ def _get_user_param(design, name, required=True):
 
 def _find_sketch(design, ui):
     """Find the target sketch by selection or active edit object."""
-    # First, check if user has a sketch selected
     sel = ui.activeSelections
-    if sel.count == 1:
-        sketch = adsk.fusion.Sketch.cast(sel.item(0).entity)
-        if sketch:
-            return sketch
+
+    # Check if user has a sketch selected
+    if sel.count >= 1:
+        for i in range(sel.count):
+            ent = sel.item(i).entity
+            sketch = adsk.fusion.Sketch.cast(ent)
+            if sketch:
+                return sketch
+
+            # Check if a sketch circle is selected - infer sketch from it
+            circle = adsk.fusion.SketchCircle.cast(ent)
+            if circle:
+                return circle.parentSketch
+
+            # Check if a sketch text is selected - infer sketch from it
+            text = adsk.fusion.SketchText.cast(ent)
+            if text:
+                return text.parentSketch
 
     # Check if we're currently editing a sketch
     app = adsk.core.Application.get()
@@ -96,6 +112,22 @@ def _delete_generated_features(design):
                 f.deleteMe()
 
 
+def _find_circle(sketch, ui):
+    """Find the guide circle in the sketch. Returns (center_point, radius, circle_entity) or None.
+
+    Requires the user to select a circle explicitly for circular mode.
+    """
+    # Check if user has a circle selected
+    sel = ui.activeSelections
+    for i in range(sel.count):
+        ent = sel.item(i).entity
+        circle = adsk.fusion.SketchCircle.cast(ent)
+        if circle and circle.parentSketch == sketch:
+            return (circle.centerSketchPoint.geometry, circle.radius, circle)
+
+    return None
+
+
 def run(context):
     ui = None
     timeline_start = None
@@ -132,12 +164,13 @@ def run(context):
             )
             return
 
+        # --- Detect circular vs linear mode ---
+        circle_info = _find_circle(sketch, ui)
+        is_circular = circle_info is not None
+
         # --- Read parameters ---
         seg_count_param = _get_user_param(design, 'pcSegmentCount')
-        pitch_param = _get_user_param(design, 'pcSegmentPitch')
         start_param = _get_user_param(design, 'pcStartNumber')
-        # Optional ones
-        dir_param = _get_user_param(design, 'pcDirection', required=False)
         cut_depth_param = _get_user_param(design, 'pcCutDepth', required=False)
 
         seg_count = int(round(seg_count_param.value))
@@ -145,26 +178,47 @@ def run(context):
             ui.messageBox('PatternedCount: pcSegmentCount must be at least 1.')
             return
 
-        pitch = pitch_param.value  # internal length units (cm)
         start_number = int(round(start_param.value))
-
-        # Direction: "+X", "-X", "+Y", "-Y" (default "+X")
-        dir_x = 1
-        dir_y = 0
-        if dir_param:
-            # Text params: expression contains the quoted string, e.g. "'+Y'"
-            dir_str = dir_param.expression.strip().strip("'\"").upper()
-            if dir_str == "-X":
-                dir_x, dir_y = -1, 0
-            elif dir_str == "+Y":
-                dir_x, dir_y = 0, 1
-            elif dir_str == "-Y":
-                dir_x, dir_y = 0, -1
-            # else default "+X"
 
         cut_depth = None
         if cut_depth_param:
             cut_depth = cut_depth_param.value  # internal units (cm)
+
+        # Mode-specific parameters
+        if is_circular:
+            # Circular mode: use circle center and radius
+            circle_center, circle_radius, guide_circle_entity = circle_info
+
+            # Arc direction: "CW" or "CCW" (default "CCW")
+            arc_dir_param = _get_user_param(design, 'pcArcDirection', required=False)
+            arc_clockwise = False  # Default CCW
+            if arc_dir_param:
+                arc_str = arc_dir_param.expression.strip().strip("'\"").upper()
+                if arc_str == "CW":
+                    arc_clockwise = True
+
+            # Angle between segments (full circle divided by segment count)
+            segment_angle = 2 * math.pi / seg_count
+            if arc_clockwise:
+                segment_angle = -segment_angle
+        else:
+            # Linear mode: require pitch and direction
+            pitch_param = _get_user_param(design, 'pcSegmentPitch')
+            dir_param = _get_user_param(design, 'pcDirection', required=False)
+
+            pitch = pitch_param.value  # internal length units (cm)
+
+            # Direction: "+X", "-X", "+Y", "-Y" (default "+X")
+            dir_x = 1
+            dir_y = 0
+            if dir_param:
+                dir_str = dir_param.expression.strip().strip("'\"").upper()
+                if dir_str == "-X":
+                    dir_x, dir_y = -1, 0
+                elif dir_str == "+Y":
+                    dir_x, dir_y = 0, 1
+                elif dir_str == "-Y":
+                    dir_x, dir_y = 0, -1
 
         # --- If editing sketch, finish it first for text generation ---
         was_editing = False
@@ -206,27 +260,28 @@ def run(context):
         except:
             template_angle = 0.0
         try:
-            template_h_flip = template_text.isHorizontalFlip
-            template_v_flip = template_text.isVerticalFlip
+            template_font = template_text.fontName
         except:
-            template_h_flip = False
-            template_v_flip = False
+            template_font = None
 
-        # Convenience
+        # Text alignment for creating new text
         horiz_align = adsk.core.HorizontalAlignments.CenterHorizontalAlignment
         vert_align = adsk.core.VerticalAlignments.MiddleVerticalAlignment
+
+        # --- For circular mode, calculate starting angle from template position ---
+        if is_circular:
+            # Vector from circle center to template text center
+            dx_from_center = base_cx - circle_center.x
+            dy_from_center = base_cy - circle_center.y
+            # Starting angle (where template is on the circle)
+            start_angle = math.atan2(dy_from_center, dx_from_center)
 
         # --- Generate texts for segments 1..seg_count-1 ---
         for i in range(1, seg_count):
             n = start_number + i
             label = str(n)
 
-            # Target center for this segment
-            step = i * pitch
-            target_cx = base_cx + step * dir_x
-            target_cy = base_cy + step * dir_y
-
-            # Copy the template text and move it to target position
+            # Copy the template text
             copy_coll = adsk.core.ObjectCollection.create()
             copy_coll.add(template_text)
             new_entities = sketch.copy(copy_coll, adsk.core.Matrix3D.create())
@@ -237,23 +292,51 @@ def run(context):
             # Tag as generated so we can identify and delete it later
             new_text.attributes.add(ATTR_GROUP, ATTR_NAME, label)
 
-            # Compute its current center
+            # Compute current center of copied text
             nb = new_text.boundingBox
             nmin = nb.minPoint
             nmax = nb.maxPoint
             cur_cx = (nmin.x + nmax.x) * 0.5
             cur_cy = (nmin.y + nmax.y) * 0.5
 
-            # Translation vector from current center to target center
-            dx = target_cx - cur_cx
-            dy = target_cy - cur_cy
+            if is_circular:
+                # Circular mode: position on circle and rotate
+                angle_offset = i * segment_angle
+                target_angle = start_angle + angle_offset
 
-            xform = adsk.core.Matrix3D.create()
-            xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
+                # Target position on circle
+                target_cx = circle_center.x + circle_radius * math.cos(target_angle)
+                target_cy = circle_center.y + circle_radius * math.sin(target_angle)
 
-            coll = adsk.core.ObjectCollection.create()
-            coll.add(new_text)
-            sketch.move(coll, xform)
+                # Move to target position
+                dx = target_cx - cur_cx
+                dy = target_cy - cur_cy
+
+                xform = adsk.core.Matrix3D.create()
+                xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
+
+                coll = adsk.core.ObjectCollection.create()
+                coll.add(new_text)
+                sketch.move(coll, xform)
+
+                # Note: SketchText rotation via API doesn't work reliably.
+                # The text will be positioned correctly but not rotated.
+                # User should set template text orientation appropriately.
+            else:
+                # Linear mode: simple translation
+                step = i * pitch
+                target_cx = base_cx + step * dir_x
+                target_cy = base_cy + step * dir_y
+
+                dx = target_cx - cur_cx
+                dy = target_cy - cur_cy
+
+                xform = adsk.core.Matrix3D.create()
+                xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
+
+                coll = adsk.core.ObjectCollection.create()
+                coll.add(new_text)
+                sketch.move(coll, xform)
 
         # --- Create cuts and bodies if pcCutDepth is set ---
         bodies_created = 0
@@ -271,17 +354,36 @@ def run(context):
             # Get the component containing the sketch
             comp = sketch.parentComponent
 
-            # Collect all text bounding boxes and their numbers before exploding
+            # Collect all text positions and their numbers before exploding
+            # Store centroid for more reliable matching with rotated text
+            # Also calculate rotation angle for each position (for circular mode)
             text_boxes = []
             for i in range(texts.count):
                 t = texts.item(i)
                 bb = t.boundingBox
                 # Get the number from the text content
                 text_content = t.text
+                # Calculate centroid
+                cx = (bb.minPoint.x + bb.maxPoint.x) * 0.5
+                cy = (bb.minPoint.y + bb.maxPoint.y) * 0.5
+
+                # Calculate rotation angle for this text position (circular mode)
+                rotation_angle = 0.0
+                if is_circular:
+                    # Which segment is this? (0 = template, 1 = first generated, etc.)
+                    try:
+                        num_val = int(text_content)
+                        segment_idx = num_val - start_number
+                        rotation_angle = segment_idx * segment_angle
+                    except:
+                        pass
+
                 text_boxes.append({
                     'min': bb.minPoint,
                     'max': bb.maxPoint,
-                    'number': text_content
+                    'centroid': (cx, cy),
+                    'number': text_content,
+                    'rotation': rotation_angle
                 })
 
             # Explode all texts to create actual curve profiles
@@ -301,8 +403,82 @@ def run(context):
                 except:
                     pass
 
+            # In circular mode, rotate curves by matching them to text positions
+            rotations_applied = 0
+            curves_to_delete = []  # Collect curves to delete after all rotations
+            if is_circular:
+                # First, delete all sketch constraints to allow free movement
+                try:
+                    constraints = sketch.geometricConstraints
+                    for i in range(constraints.count - 1, -1, -1):
+                        constraints.item(i).deleteMe()
+                except:
+                    pass
+
+                # Now collect all curves and group them by which text box they belong to
+                # based on their geometric center
+                for tb in text_boxes:
+                    if tb['rotation'] == 0.0:
+                        continue  # Skip template (no rotation needed)
+
+                    rot_cx, rot_cy = tb['centroid']
+                    rot_angle = tb['rotation']
+                    min_pt, max_pt = tb['min'], tb['max']
+
+                    # Find curves whose center is within this text's bounding box
+                    # Use a slightly expanded box for tolerance
+                    tol = 0.1
+                    curves_for_this_text = adsk.core.ObjectCollection.create()
+
+                    for i in range(sketch.sketchCurves.count):
+                        curve = sketch.sketchCurves.item(i)
+                        try:
+                            # Get curve's bounding box center
+                            bb = curve.boundingBox
+                            curve_cx = (bb.minPoint.x + bb.maxPoint.x) / 2
+                            curve_cy = (bb.minPoint.y + bb.maxPoint.y) / 2
+
+                            # Check if curve center is within text bounding box
+                            if (min_pt.x - tol <= curve_cx <= max_pt.x + tol and
+                                min_pt.y - tol <= curve_cy <= max_pt.y + tol):
+                                curves_for_this_text.add(curve)
+                        except:
+                            pass
+
+                    if curves_for_this_text.count > 0:
+                        rot_xform = adsk.core.Matrix3D.create()
+                        rot_xform.setToRotation(
+                            rot_angle,
+                            adsk.core.Vector3D.create(0, 0, 1),
+                            adsk.core.Point3D.create(rot_cx, rot_cy, 0)
+                        )
+                        try:
+                            # Copy with transform, then delete originals
+                            new_curves = sketch.copy(curves_for_this_text, rot_xform)
+                            if new_curves and new_curves.count > 0:
+                                # Collect curves to delete (store as list of entities)
+                                for j in range(curves_for_this_text.count):
+                                    curves_to_delete.append(curves_for_this_text.item(j))
+                                rotations_applied += 1
+                        except:
+                            pass
+
+                # Batch delete all original curves after rotations are done
+                for curve in curves_to_delete:
+                    try:
+                        curve.deleteMe()
+                    except:
+                        pass
+
             # Recompute to ensure profiles are available
             adsk.doEvents()
+
+            # Make guide circle construction geometry to exclude it from profiles
+            if is_circular and guide_circle_entity:
+                try:
+                    guide_circle_entity.isConstruction = True
+                except:
+                    pass
 
             # First pass: collect all profile areas that are inside text bounding boxes
             # to determine what a "normal" character area looks like
@@ -332,10 +508,26 @@ def run(context):
                 median_area = sorted_areas[len(sorted_areas) // 2]
                 max_char_area = median_area * 3
             else:
-                max_char_area = pitch * text_height * 2
+                # Fallback: estimate based on text height and spacing
+                if is_circular:
+                    # Use arc length between segments as spacing estimate
+                    spacing = circle_radius * abs(segment_angle)
+                else:
+                    spacing = pitch
+                max_char_area = spacing * text_height * 2
 
-            # Helper to check if a profile contains projected geometry
-            def has_projected_curves(profile):
+            # Get the guide circle entity (if in circular mode) to exclude from profiles
+            guide_circle = guide_circle_entity if is_circular else None
+
+            # Get guide circle properties for arc matching
+            guide_center = None
+            guide_radius_val = None
+            if guide_circle:
+                guide_center = guide_circle.centerSketchPoint.geometry
+                guide_radius_val = guide_circle.radius
+
+            # Helper to check if a profile contains excluded geometry
+            def has_excluded_curves(profile):
                 try:
                     for loop in profile.profileLoops:
                         for curve in loop.profileCurves:
@@ -343,6 +535,26 @@ def run(context):
                             # Check if it's a projected entity (references external geometry)
                             if hasattr(ent, 'isReference') and ent.isReference:
                                 return True
+                            # Check if it's construction geometry
+                            if hasattr(ent, 'isConstruction') and ent.isConstruction:
+                                return True
+                            # Check if it's the guide circle (in circular mode)
+                            if guide_circle and ent == guide_circle:
+                                return True
+                            # Check if it's an arc from the guide circle (when circle is split by text)
+                            if guide_center and guide_radius_val:
+                                arc = adsk.fusion.SketchArc.cast(ent)
+                                if arc:
+                                    arc_center = arc.centerSketchPoint.geometry
+                                    arc_radius = arc.radius
+                                    # Check if arc matches guide circle geometry (with tolerance)
+                                    center_dist = math.sqrt(
+                                        (arc_center.x - guide_center.x)**2 +
+                                        (arc_center.y - guide_center.y)**2
+                                    )
+                                    # Use 0.01 cm (0.1mm) tolerance
+                                    if center_dist < 0.01 and abs(arc_radius - guide_radius_val) < 0.01:
+                                        return True
                 except:
                     pass
                 return False
@@ -354,8 +566,8 @@ def run(context):
             for i in range(profiles.count):
                 profile = profiles.item(i)
                 try:
-                    # Skip profiles that contain projected geometry
-                    if has_projected_curves(profile):
+                    # Skip profiles that contain projected or construction geometry
+                    if has_excluded_curves(profile):
                         continue
 
                     area_props = profile.areaProperties()
@@ -367,14 +579,28 @@ def run(context):
                     if area > max_char_area:
                         continue
 
-                    # Check if centroid is in any text box
+                    # Match profile to text - use distance for circular, bounding box for linear
                     matched_number = None
-                    for tb in text_boxes:
-                        min_pt, max_pt = tb['min'], tb['max']
-                        if (min_pt.x <= cx <= max_pt.x and
-                            min_pt.y <= cy <= max_pt.y):
-                            matched_number = tb['number']
-                            break
+                    if is_circular:
+                        # For circular mode, find nearest text centroid
+                        best_dist = float('inf')
+                        for tb in text_boxes:
+                            tcx, tcy = tb['centroid']
+                            dist = math.sqrt((cx - tcx)**2 + (cy - tcy)**2)
+                            if dist < best_dist:
+                                best_dist = dist
+                                matched_number = tb['number']
+                        # Only accept if reasonably close (within text height)
+                        if best_dist > text_height * 2:
+                            matched_number = None
+                    else:
+                        # For linear mode, use bounding box containment
+                        for tb in text_boxes:
+                            min_pt, max_pt = tb['min'], tb['max']
+                            if (min_pt.x <= cx <= max_pt.x and
+                                min_pt.y <= cy <= max_pt.y):
+                                matched_number = tb['number']
+                                break
 
                     if matched_number is not None:
                         # Get profile bounding box
@@ -458,7 +684,10 @@ def run(context):
                             sketch_transform_inv.invert()
 
                             # Add small tolerance for centroid matching
-                            tol = pitch * 0.5
+                            if is_circular:
+                                tol = circle_radius * abs(segment_angle) * 0.5
+                            else:
+                                tol = pitch * 0.5
 
                             for j in range(end_face_count):
                                 face = end_faces.item(j)
@@ -472,13 +701,26 @@ def run(context):
                                     fcx, fcy = sketch_centroid.x, sketch_centroid.y
 
                                     face_number = None
-                                    for tb in text_boxes:
-                                        min_pt, max_pt = tb['min'], tb['max']
-                                        # Use tolerance for matching
-                                        if (min_pt.x - tol <= fcx <= max_pt.x + tol and
-                                            min_pt.y - tol <= fcy <= max_pt.y + tol):
-                                            face_number = tb['number']
-                                            break
+                                    if is_circular:
+                                        # For circular mode, find nearest text centroid
+                                        best_dist = float('inf')
+                                        for tb in text_boxes:
+                                            tcx, tcy = tb['centroid']
+                                            dist = math.sqrt((fcx - tcx)**2 + (fcy - tcy)**2)
+                                            if dist < best_dist:
+                                                best_dist = dist
+                                                face_number = tb['number']
+                                        # Only accept if reasonably close
+                                        if best_dist > tol:
+                                            face_number = None
+                                    else:
+                                        # For linear mode, use bounding box with tolerance
+                                        for tb in text_boxes:
+                                            min_pt, max_pt = tb['min'], tb['max']
+                                            if (min_pt.x - tol <= fcx <= max_pt.x + tol and
+                                                min_pt.y - tol <= fcy <= max_pt.y + tol):
+                                                face_number = tb['number']
+                                                break
 
                                     body_input = extrudes.createInput(
                                         face,
@@ -506,9 +748,9 @@ def run(context):
                             body_errors.append(str(e))
 
         # --- Report results ---
-        msg = f'PatternedCount: Created {seg_count} sketch text numbers starting at {start_number}.'
+        mode_str = "circular" if is_circular else "linear"
+        msg = f'PatternedCount ({mode_str}): Created {seg_count} numbers starting at {start_number}.'
         if cut_depth and cut_depth > 0:
-            msg += f'\nValid profiles: {len(valid_profiles)}, outer (non-hole): {profiles_in_text}'
             msg += f'\nCuts: {cuts_created}, Bodies: {bodies_created}'
             if cut_errors:
                 msg += f'\nCut errors: {cut_errors[0]}'
