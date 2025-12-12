@@ -1,25 +1,25 @@
 # Andli's Fusion Add-ins
 
-A collection of parameter-driven Fusion 360 scripts for common design patterns. No GUI dialogs—just set your parameters and run.
+A collection of Fusion 360 scripts for common design patterns.
 
 ## Add-ins
 
 ### PatternedCount
 
-Automatically generates numbered text sequences for sliding counters, dial indicators, and other patterned components. Ideal for multi-material 3D printing.
+Automatically generates numbered text sequences for sliding counters, dial indicators, and other patterned components. Ideal for multi-material 3D printing. Parameter-driven with no GUI.
 
 [View PatternedCount documentation](PatternedCount/README.md)
 
 ![PatternedCount Linear](PatternedCount/example-linear.png)
 ![PatternedCount Circular](PatternedCount/example-circle.png)
-![HexPattern Example](HexPattern/example.png)
-
 
 ### HexPattern
 
-Creates a honeycomb pattern of hexagonal cuts on a selected face. Great for ventilation grilles, decorative panels, or lightweight structures.
+Creates a honeycomb pattern of hexagonal cuts on a selected face. Great for ventilation grilles, decorative panels, or lightweight structures. Features a dialog for configuring hex count, margin, orientation, and partial hex options.
 
 [View HexPattern documentation](HexPattern/README.md)
+
+![HexPattern Example](HexPattern/example.png)
 
 ## Installation
 
@@ -33,13 +33,7 @@ Repeat for each add-in you want to use.
 
 ## Usage
 
-All add-ins follow the same workflow:
-
-1. Set up user parameters in **Modify → Change Parameters**
-2. Select the appropriate geometry (sketch, face, etc.)
-3. Run the script from **Scripts and Add-Ins** (`Shift+S`)
-
-See individual add-in READMEs for specific parameters and usage.
+See individual add-in READMEs for specific usage instructions.
 
 ## License
 

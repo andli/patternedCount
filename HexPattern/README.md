@@ -6,42 +6,34 @@
 
 ## Features
 
-- Creates evenly-spaced flat-top hexagons in a honeycomb arrangement
-- Automatically calculates hexagon size to fit specified count across width
-- Configurable margin/gap between hexagons
+- Flat-top or pointy-top hexagon orientation
+- Configurable number of hexagons across the width
+- Adjustable margin/gap between hexagons
+- Option to cut partial hexes at edges or only full hexes
+- Live hex width preview in the dialog
 - Cuts through the entire body thickness
-- Fully parameter-driven — **no GUI**, no prompts
-
-## User Parameters
-
-Create these parameters in **Modify → Change Parameters**.
-
-| Name        | Type           | Description                                          |
-| ----------- | -------------- | ---------------------------------------------------- |
-| `hexNumX`   | Unitless (int) | Number of hexagons across the face width (e.g., `5`) |
-| `hexMargin` | Length         | Gap between hexagon edges (e.g., `0.5 mm`)           |
-
-**Note:** Integer parameters must be created as **unitless** (leave the Unit field blank).
 
 ## Usage
 
-1. Create your user parameters (`hexNumX`, `hexMargin`)
-2. Select an edge on a rectangular face — this edge defines the "width" direction for `hexNumX`
-3. Run **HexPattern** from **Scripts and Add-Ins** (`Shift+S`)
-4. The add-in will:
-   - Calculate hexagon size based on the edge length and `hexNumX`
-   - Generate a honeycomb layout filling the face
-   - Cut through the body with all hexagons
+1. Select an edge on a rectangular face — this edge defines the "width" direction for hex count
+2. Run **HexPattern** from **Scripts and Add-Ins** (`Shift+S`)
+3. Configure options in the dialog:
+   - **Number of Hexes**: How many hexagons across the selected edge
+   - **Hex Width**: Displays the calculated width of each hexagon
+   - **Margin**: Gap between hexagon edges
+   - **Orientation**: Flat Top or Pointy Top
+   - **Cut partial hexes at edges**: Include partial hexes at boundaries, or only full hexes
+4. Click **OK** to create the pattern
 
 ## How Sizing Works
 
-- The hexagon radius is calculated so that exactly `hexNumX` hexagons fit along the selected edge
-- The `hexMargin` parameter creates gaps between adjacent hexagon edges
+- The hexagon size is calculated so that the specified number fits along the selected edge
+- The margin parameter creates gaps between adjacent hexagon edges
 - Rows alternate with a half-column offset (standard honeycomb pattern)
-- Hexagons that would extend outside the face boundaries are omitted
+- With "Cut partial hexes" disabled, only complete hexagons are cut
 
 ## Notes
 
 - Works best with rectangular or near-rectangular faces
-- The selected edge determines which direction `hexNumX` applies to
-- Very large margins relative to face size may result in no hexagons fitting
+- The selected edge determines which direction the hex count applies to
+- Very large margins relative to face size may result in fewer hexagons fitting
