@@ -11,7 +11,7 @@
 #    - pcCutDepth       (length, e.g. 0.4 mm; optional - enables cut/body creation)
 #
 # 2. Create a sketch on a face, add ONE Sketch Text as the template.
-#    - For circular mode: include a circle in the sketch (the text will follow it)
+#    - For circular mode: select a guide circle before running
 # 3. Select the sketch in the browser (or edit it).
 # 4. Run this script from Scripts & Add-Ins.
 
@@ -128,651 +128,602 @@ def _find_circle(sketch, ui):
     return None
 
 
+def _has_excluded_curves(profile, guide_circle, guide_center, guide_radius_val):
+    """Check if a profile contains excluded geometry (reference, construction, or guide circle)."""
+    try:
+        for loop in profile.profileLoops:
+            for curve in loop.profileCurves:
+                ent = curve.sketchEntity
+                # Check if it's a projected entity (references external geometry)
+                if hasattr(ent, 'isReference') and ent.isReference:
+                    return True
+                # Check if it's construction geometry
+                if hasattr(ent, 'isConstruction') and ent.isConstruction:
+                    return True
+                # Check if it's the guide circle (in circular mode)
+                if guide_circle and ent == guide_circle:
+                    return True
+                # Check if it's an arc from the guide circle (when circle is split by text)
+                if guide_center and guide_radius_val:
+                    arc = adsk.fusion.SketchArc.cast(ent)
+                    if arc:
+                        arc_center = arc.centerSketchPoint.geometry
+                        arc_radius = arc.radius
+                        # Check if arc matches guide circle geometry (with tolerance)
+                        center_dist = math.sqrt(
+                            (arc_center.x - guide_center.x)**2 +
+                            (arc_center.y - guide_center.y)**2
+                        )
+                        # Use 0.01 cm (0.1mm) tolerance
+                        if center_dist < 0.01 and abs(arc_radius - guide_radius_val) < 0.01:
+                            return True
+    except:
+        pass
+    return False
+
+
+def _generate_texts(sketch, template_text, seg_count, start_number, is_circular,
+                    circle_center=None, circle_radius=None, segment_angle=None,
+                    pitch=None, dir_x=None, dir_y=None):
+    """Generate numbered text copies from template."""
+    texts = sketch.sketchTexts
+
+    # Make sure template shows the start number
+    template_param = template_text.textParameter
+    label0 = str(start_number)
+    template_param.expression = f"'{label0}'"
+
+    # Determine template center in sketch space
+    tpl_box = template_text.boundingBox
+    tpl_min = tpl_box.minPoint
+    tpl_max = tpl_box.maxPoint
+    base_cx = (tpl_min.x + tpl_max.x) * 0.5
+    base_cy = (tpl_min.y + tpl_max.y) * 0.5
+
+    # Auto-delete: only remove texts we previously generated (have our attribute)
+    for i in range(texts.count - 1, -1, -1):
+        t = texts.item(i)
+        if _is_generated(t):
+            t.deleteMe()
+
+    # For circular mode, calculate starting angle from template position
+    start_angle = 0.0
+    if is_circular:
+        dx_from_center = base_cx - circle_center.x
+        dy_from_center = base_cy - circle_center.y
+        start_angle = math.atan2(dy_from_center, dx_from_center)
+
+    # Generate texts for segments 1..seg_count-1
+    for i in range(1, seg_count):
+        n = start_number + i
+        label = str(n)
+
+        # Copy the template text
+        copy_coll = adsk.core.ObjectCollection.create()
+        copy_coll.add(template_text)
+        new_entities = sketch.copy(copy_coll, adsk.core.Matrix3D.create())
+        new_text = adsk.fusion.SketchText.cast(new_entities.item(0))
+
+        # Update the text content
+        new_text.textParameter.expression = f"'{label}'"
+        # Tag as generated so we can identify and delete it later
+        new_text.attributes.add(ATTR_GROUP, ATTR_NAME, label)
+
+        # Compute current center of copied text
+        nb = new_text.boundingBox
+        nmin = nb.minPoint
+        nmax = nb.maxPoint
+        cur_cx = (nmin.x + nmax.x) * 0.5
+        cur_cy = (nmin.y + nmax.y) * 0.5
+
+        if is_circular:
+            # Circular mode: position on circle
+            angle_offset = i * segment_angle
+            target_angle = start_angle + angle_offset
+            target_cx = circle_center.x + circle_radius * math.cos(target_angle)
+            target_cy = circle_center.y + circle_radius * math.sin(target_angle)
+        else:
+            # Linear mode: simple translation
+            step = i * pitch
+            target_cx = base_cx + step * dir_x
+            target_cy = base_cy + step * dir_y
+
+        dx = target_cx - cur_cx
+        dy = target_cy - cur_cy
+
+        xform = adsk.core.Matrix3D.create()
+        xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
+
+        coll = adsk.core.ObjectCollection.create()
+        coll.add(new_text)
+        sketch.move(coll, xform)
+
+    return base_cx, base_cy, start_angle
+
+
+def _collect_text_boxes(texts, start_number, is_circular, segment_angle):
+    """Collect text bounding boxes and metadata before exploding."""
+    text_boxes = []
+    for i in range(texts.count):
+        t = texts.item(i)
+        bb = t.boundingBox
+        text_content = t.text
+        cx = (bb.minPoint.x + bb.maxPoint.x) * 0.5
+        cy = (bb.minPoint.y + bb.maxPoint.y) * 0.5
+
+        rotation_angle = 0.0
+        if is_circular:
+            try:
+                num_val = int(text_content)
+                segment_idx = num_val - start_number
+                rotation_angle = segment_idx * segment_angle
+            except:
+                pass
+
+        text_boxes.append({
+            'min': bb.minPoint,
+            'max': bb.maxPoint,
+            'centroid': (cx, cy),
+            'number': text_content,
+            'rotation': rotation_angle
+        })
+    return text_boxes
+
+
+def _explode_texts(sketch):
+    """Explode all texts in sketch to curves."""
+    texts = sketch.sketchTexts
+    texts_to_explode = []
+    for i in range(texts.count):
+        texts_to_explode.append(texts.item(i))
+
+    for t in texts_to_explode:
+        try:
+            t.textParameter.expression = t.textParameter.expression
+        except:
+            pass
+        try:
+            t.explode()
+        except:
+            pass
+
+
+def _rotate_curves_circular(sketch, text_boxes):
+    """Rotate exploded curves for circular mode."""
+    # Delete all sketch constraints to allow free movement
+    try:
+        constraints = sketch.geometricConstraints
+        for i in range(constraints.count - 1, -1, -1):
+            constraints.item(i).deleteMe()
+    except:
+        pass
+
+    curves_to_delete = []
+
+    for tb in text_boxes:
+        if tb['rotation'] == 0.0:
+            continue  # Skip template (no rotation needed)
+
+        rot_cx, rot_cy = tb['centroid']
+        rot_angle = tb['rotation']
+        min_pt, max_pt = tb['min'], tb['max']
+
+        # Find curves whose center is within this text's bounding box
+        tol = 0.1
+        curves_for_this_text = adsk.core.ObjectCollection.create()
+
+        for i in range(sketch.sketchCurves.count):
+            curve = sketch.sketchCurves.item(i)
+            try:
+                bb = curve.boundingBox
+                curve_cx = (bb.minPoint.x + bb.maxPoint.x) / 2
+                curve_cy = (bb.minPoint.y + bb.maxPoint.y) / 2
+
+                if (min_pt.x - tol <= curve_cx <= max_pt.x + tol and
+                    min_pt.y - tol <= curve_cy <= max_pt.y + tol):
+                    curves_for_this_text.add(curve)
+            except:
+                pass
+
+        if curves_for_this_text.count > 0:
+            rot_xform = adsk.core.Matrix3D.create()
+            rot_xform.setToRotation(
+                rot_angle,
+                adsk.core.Vector3D.create(0, 0, 1),
+                adsk.core.Point3D.create(rot_cx, rot_cy, 0)
+            )
+            try:
+                new_curves = sketch.copy(curves_for_this_text, rot_xform)
+                if new_curves and new_curves.count > 0:
+                    for j in range(curves_for_this_text.count):
+                        curves_to_delete.append(curves_for_this_text.item(j))
+            except:
+                pass
+
+    # Batch delete original curves
+    for curve in curves_to_delete:
+        try:
+            curve.deleteMe()
+        except:
+            pass
+
+
+def _collect_valid_profiles(sketch, text_boxes, text_height, max_char_area, is_circular,
+                            guide_circle, guide_center, guide_radius_val):
+    """Collect profiles that belong to text characters."""
+    valid_profiles = []
+    profiles = sketch.profiles
+
+    for i in range(profiles.count):
+        profile = profiles.item(i)
+        try:
+            if _has_excluded_curves(profile, guide_circle, guide_center, guide_radius_val):
+                continue
+
+            area_props = profile.areaProperties()
+            centroid = area_props.centroid
+            area = area_props.area
+            cx, cy = centroid.x, centroid.y
+
+            if area > max_char_area:
+                continue
+
+            matched_number = None
+            if is_circular:
+                best_dist = float('inf')
+                for tb in text_boxes:
+                    tcx, tcy = tb['centroid']
+                    dist = math.sqrt((cx - tcx)**2 + (cy - tcy)**2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        matched_number = tb['number']
+                if best_dist > text_height * 2:
+                    matched_number = None
+            else:
+                for tb in text_boxes:
+                    min_pt, max_pt = tb['min'], tb['max']
+                    if (min_pt.x <= cx <= max_pt.x and min_pt.y <= cy <= max_pt.y):
+                        matched_number = tb['number']
+                        break
+
+            if matched_number is not None:
+                bb = profile.boundingBox
+                valid_profiles.append({
+                    'profile': profile,
+                    'area': area,
+                    'centroid': (cx, cy),
+                    'min': (bb.minPoint.x, bb.minPoint.y),
+                    'max': (bb.maxPoint.x, bb.maxPoint.y),
+                    'number': matched_number
+                })
+        except:
+            pass
+
+    return valid_profiles
+
+
+def _filter_outer_profiles(valid_profiles):
+    """Filter out inner profiles (holes inside other profiles)."""
+    def is_contained_in(inner, outer):
+        return (outer['min'][0] < inner['min'][0] and
+                outer['min'][1] < inner['min'][1] and
+                outer['max'][0] > inner['max'][0] and
+                outer['max'][1] > inner['max'][1])
+
+    outer_profiles = []
+    for p in valid_profiles:
+        is_inner = False
+        for other in valid_profiles:
+            if p is not other and is_contained_in(p, other):
+                is_inner = True
+                break
+        if not is_inner:
+            outer_profiles.append(p)
+
+    return outer_profiles
+
+
+def _create_cuts_and_bodies(comp, sketch, outer_profiles, cut_depth, text_boxes, is_circular,
+                            circle_radius=None, segment_angle=None, pitch=None):
+    """Create cut features and body extrusions."""
+    extrudes = comp.features.extrudeFeatures
+    cuts_created = 0
+    bodies_created = 0
+    cut_errors = []
+    body_errors = []
+
+    profile_collection = adsk.core.ObjectCollection.create()
+    for p in outer_profiles:
+        profile_collection.add(p['profile'])
+
+    if profile_collection.count == 0:
+        return 0, 0, cut_errors, body_errors
+
+    # Create a single cut with all profiles
+    cut_input = extrudes.createInput(
+        profile_collection,
+        adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    cut_distance = adsk.core.ValueInput.createByReal(-cut_depth)
+    cut_input.setDistanceExtent(False, cut_distance)
+
+    try:
+        cut_feature = extrudes.add(cut_input)
+        cut_feature.name = f"{GENERATED_PREFIX}cuts"
+        cuts_created = profile_collection.count
+    except Exception as e:
+        cut_errors.append(str(e))
+        return 0, 0, cut_errors, body_errors
+
+    # Create new bodies from the cut's end faces
+    try:
+        end_faces = cut_feature.endFaces
+        sketch_transform = sketch.transform
+        sketch_transform_inv = sketch_transform.copy()
+        sketch_transform_inv.invert()
+
+        if is_circular:
+            tol = circle_radius * abs(segment_angle) * 0.5
+        else:
+            tol = pitch * 0.5
+
+        for j in range(end_faces.count):
+            face = end_faces.item(j)
+            try:
+                face_centroid = face.centroid
+                sketch_centroid = face_centroid.copy()
+                sketch_centroid.transformBy(sketch_transform_inv)
+                fcx, fcy = sketch_centroid.x, sketch_centroid.y
+
+                face_number = None
+                if is_circular:
+                    best_dist = float('inf')
+                    for tb in text_boxes:
+                        tcx, tcy = tb['centroid']
+                        dist = math.sqrt((fcx - tcx)**2 + (fcy - tcy)**2)
+                        if dist < best_dist:
+                            best_dist = dist
+                            face_number = tb['number']
+                    if best_dist > tol:
+                        face_number = None
+                else:
+                    for tb in text_boxes:
+                        min_pt, max_pt = tb['min'], tb['max']
+                        if (min_pt.x - tol <= fcx <= max_pt.x + tol and
+                            min_pt.y - tol <= fcy <= max_pt.y + tol):
+                            face_number = tb['number']
+                            break
+
+                body_input = extrudes.createInput(
+                    face,
+                    adsk.fusion.FeatureOperations.NewBodyFeatureOperation
+                )
+                body_distance = adsk.core.ValueInput.createByReal(cut_depth)
+                body_input.setDistanceExtent(False, body_distance)
+                body_feature = extrudes.add(body_input)
+                body_feature.name = f"{GENERATED_PREFIX}body_{j}"
+
+                if body_feature.bodies.count > 0:
+                    new_body = body_feature.bodies.item(0)
+                    if face_number is not None:
+                        new_body.name = f"n{face_number}"
+
+                bodies_created += 1
+            except Exception as e:
+                body_errors.append(f"Face {j}: {str(e)}")
+    except Exception as e:
+        body_errors.append(str(e))
+
+    return cuts_created, bodies_created, cut_errors, body_errors
+
+
+def _run_impl(app, ui):
+    """Main implementation logic."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        ui.messageBox('PatternedCount: No active Fusion design.')
+        return
+
+    # Start a timeline group so all operations can be undone at once
+    timeline = design.timeline
+    timeline_start = timeline.markerPosition
+
+    # Find the sketch
+    sketch = _find_sketch(design, ui)
+    if not sketch:
+        ui.messageBox(
+            'PatternedCount:\n'
+            'No sketch found. Select a sketch in the browser or edit a sketch, '
+            'then run the script again.'
+        )
+        return
+
+    # Find the template text
+    template_text = _find_template_text(sketch, ui)
+    if not template_text:
+        ui.messageBox(
+            'PatternedCount:\n'
+            'Could not determine template text. Ensure the sketch has exactly '
+            'one non-generated text, or select the template text.'
+        )
+        return
+
+    # Detect circular vs linear mode
+    circle_info = _find_circle(sketch, ui)
+    is_circular = circle_info is not None
+
+    # Read parameters
+    seg_count_param = _get_user_param(design, 'pcSegmentCount')
+    start_param = _get_user_param(design, 'pcStartNumber')
+    cut_depth_param = _get_user_param(design, 'pcCutDepth', required=False)
+
+    seg_count = int(round(seg_count_param.value))
+    if seg_count < 1:
+        ui.messageBox('PatternedCount: pcSegmentCount must be at least 1.')
+        return
+
+    start_number = int(round(start_param.value))
+    cut_depth = cut_depth_param.value if cut_depth_param else None
+
+    # Mode-specific parameters
+    circle_center = circle_radius = segment_angle = guide_circle_entity = None
+    pitch = dir_x = dir_y = None
+
+    if is_circular:
+        circle_center, circle_radius, guide_circle_entity = circle_info
+        arc_dir_param = _get_user_param(design, 'pcArcDirection', required=False)
+        arc_clockwise = False
+        if arc_dir_param:
+            arc_str = arc_dir_param.expression.strip().strip("'\"").upper()
+            if arc_str == "CW":
+                arc_clockwise = True
+        segment_angle = 2 * math.pi / seg_count
+        if arc_clockwise:
+            segment_angle = -segment_angle
+    else:
+        pitch_param = _get_user_param(design, 'pcSegmentPitch')
+        dir_param = _get_user_param(design, 'pcDirection', required=False)
+        pitch = pitch_param.value
+        dir_x, dir_y = 1, 0
+        if dir_param:
+            dir_str = dir_param.expression.strip().strip("'\"").upper()
+            if dir_str == "-X":
+                dir_x, dir_y = -1, 0
+            elif dir_str == "+Y":
+                dir_x, dir_y = 0, 1
+            elif dir_str == "-Y":
+                dir_x, dir_y = 0, -1
+
+    # Ensure sketch is visible
+    sketch.isLightBulbOn = True
+
+    # Generate texts
+    _generate_texts(
+        sketch, template_text, seg_count, start_number, is_circular,
+        circle_center, circle_radius, segment_angle, pitch, dir_x, dir_y
+    )
+
+    # Create cuts and bodies if pcCutDepth is set
+    cuts_created = 0
+    bodies_created = 0
+    cut_errors = []
+    body_errors = []
+
+    if cut_depth and cut_depth > 0:
+        # Exit sketch edit mode if needed
+        if app.activeEditObject and app.activeEditObject.classType == adsk.fusion.Sketch.classType:
+            app.activeViewport.refresh()
+            design.rootComponent.activate()
+
+        _delete_generated_features(design)
+
+        comp = sketch.parentComponent
+        texts = sketch.sketchTexts
+        text_height = template_text.heightParameter.value
+
+        # Collect text boxes before exploding
+        text_boxes = _collect_text_boxes(texts, start_number, is_circular, segment_angle or 0)
+
+        # Explode texts to curves
+        _explode_texts(sketch)
+
+        # Rotate curves in circular mode
+        if is_circular:
+            _rotate_curves_circular(sketch, text_boxes)
+
+        adsk.doEvents()
+
+        # Make guide circle construction geometry
+        if is_circular and guide_circle_entity:
+            try:
+                guide_circle_entity.isConstruction = True
+            except:
+                pass
+
+        # Calculate max character area threshold
+        profile_areas = []
+        profiles = sketch.profiles
+        for i in range(profiles.count):
+            profile = profiles.item(i)
+            try:
+                area_props = profile.areaProperties()
+                centroid = area_props.centroid
+                area = area_props.area
+                cx, cy = centroid.x, centroid.y
+                for tb in text_boxes:
+                    min_pt, max_pt = tb['min'], tb['max']
+                    if min_pt.x <= cx <= max_pt.x and min_pt.y <= cy <= max_pt.y:
+                        profile_areas.append(area)
+                        break
+            except:
+                pass
+
+        if profile_areas:
+            sorted_areas = sorted(profile_areas)
+            median_area = sorted_areas[len(sorted_areas) // 2]
+            max_char_area = median_area * 3
+        else:
+            if is_circular:
+                spacing = circle_radius * abs(segment_angle)
+            else:
+                spacing = pitch
+            max_char_area = spacing * text_height * 2
+
+        # Get guide circle properties for arc matching
+        guide_circle = guide_circle_entity if is_circular else None
+        guide_center = guide_circle.centerSketchPoint.geometry if guide_circle else None
+        guide_radius_val = guide_circle.radius if guide_circle else None
+
+        # Collect and filter profiles
+        valid_profiles = _collect_valid_profiles(
+            sketch, text_boxes, text_height, max_char_area, is_circular,
+            guide_circle, guide_center, guide_radius_val
+        )
+        outer_profiles = _filter_outer_profiles(valid_profiles)
+
+        if len(outer_profiles) == 0:
+            ui.messageBox(
+                'PatternedCount:\n'
+                'No valid text profiles found in sketch. Cannot create cuts/bodies.\n'
+                'Ensure the sketch is on a face of an existing body.'
+            )
+        else:
+            cuts_created, bodies_created, cut_errors, body_errors = _create_cuts_and_bodies(
+                comp, sketch, outer_profiles, cut_depth, text_boxes, is_circular,
+                circle_radius, segment_angle, pitch
+            )
+
+    # Report results
+    mode_str = "circular" if is_circular else "linear"
+    msg = f'PatternedCount ({mode_str}): Created {seg_count} numbers starting at {start_number}.'
+    if cut_depth and cut_depth > 0:
+        msg += f'\nCuts: {cuts_created}, Bodies: {bodies_created}'
+        if cut_errors:
+            msg += f'\nCut errors: {cut_errors[0]}'
+        if body_errors:
+            msg += f'\nBody errors: {body_errors[0]}'
+    ui.messageBox(msg)
+
+    # Group all timeline operations into one undo step
+    timeline_end = timeline.markerPosition
+    if timeline_end - timeline_start >= 2:
+        try:
+            timeline_group = timeline.timelineGroups.add(timeline_start, timeline_end - 1)
+            timeline_group.name = "PatternedCount"
+        except:
+            pass
+
+
 def run(context):
     ui = None
-    timeline_start = None
     try:
         app = adsk.core.Application.get()
         ui = app.userInterface
-
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        if not design:
-            ui.messageBox('PatternedCount: No active Fusion design.')
-            return
-
-        # Start a timeline group so all operations can be undone at once
-        timeline = design.timeline
-        timeline_start = timeline.markerPosition
-
-        # --- Find the sketch ---
-        sketch = _find_sketch(design, ui)
-        if not sketch:
-            ui.messageBox(
-                'PatternedCount:\n'
-                'No sketch found. Select a sketch in the browser or edit a sketch, '
-                'then run the script again.'
-            )
-            return
-
-        # --- Find the template text ---
-        template_text = _find_template_text(sketch, ui)
-        if not template_text:
-            ui.messageBox(
-                'PatternedCount:\n'
-                'Could not determine template text. Ensure the sketch has exactly '
-                'one non-generated text, or select the template text.'
-            )
-            return
-
-        # --- Detect circular vs linear mode ---
-        circle_info = _find_circle(sketch, ui)
-        is_circular = circle_info is not None
-
-        # --- Read parameters ---
-        seg_count_param = _get_user_param(design, 'pcSegmentCount')
-        start_param = _get_user_param(design, 'pcStartNumber')
-        cut_depth_param = _get_user_param(design, 'pcCutDepth', required=False)
-
-        seg_count = int(round(seg_count_param.value))
-        if seg_count < 1:
-            ui.messageBox('PatternedCount: pcSegmentCount must be at least 1.')
-            return
-
-        start_number = int(round(start_param.value))
-
-        cut_depth = None
-        if cut_depth_param:
-            cut_depth = cut_depth_param.value  # internal units (cm)
-
-        # Mode-specific parameters
-        if is_circular:
-            # Circular mode: use circle center and radius
-            circle_center, circle_radius, guide_circle_entity = circle_info
-
-            # Arc direction: "CW" or "CCW" (default "CCW")
-            arc_dir_param = _get_user_param(design, 'pcArcDirection', required=False)
-            arc_clockwise = False  # Default CCW
-            if arc_dir_param:
-                arc_str = arc_dir_param.expression.strip().strip("'\"").upper()
-                if arc_str == "CW":
-                    arc_clockwise = True
-
-            # Angle between segments (full circle divided by segment count)
-            segment_angle = 2 * math.pi / seg_count
-            if arc_clockwise:
-                segment_angle = -segment_angle
-        else:
-            # Linear mode: require pitch and direction
-            pitch_param = _get_user_param(design, 'pcSegmentPitch')
-            dir_param = _get_user_param(design, 'pcDirection', required=False)
-
-            pitch = pitch_param.value  # internal length units (cm)
-
-            # Direction: "+X", "-X", "+Y", "-Y" (default "+X")
-            dir_x = 1
-            dir_y = 0
-            if dir_param:
-                dir_str = dir_param.expression.strip().strip("'\"").upper()
-                if dir_str == "-X":
-                    dir_x, dir_y = -1, 0
-                elif dir_str == "+Y":
-                    dir_x, dir_y = 0, 1
-                elif dir_str == "-Y":
-                    dir_x, dir_y = 0, -1
-
-        # --- If editing sketch, finish it first for text generation ---
-        was_editing = False
-        if app.activeEditObject == sketch:
-            was_editing = True
-            # We'll continue editing for now, finish later if needed
-
-        # --- Make sure we're editing the sketch to modify texts ---
-        if not was_editing:
-            sketch.isLightBulbOn = True
-            # Need to edit sketch to add/modify texts
-            # This is done by accessing sketch texts directly - no edit mode needed for API
-
-        texts = sketch.sketchTexts
-
-        # --- Make sure template shows the start number ---
-        template_param = template_text.textParameter
-        label0 = str(start_number)
-        template_param.expression = f"'{label0}'"
-
-        # --- Determine template center in sketch space ---
-        tpl_box = template_text.boundingBox
-        tpl_min = tpl_box.minPoint
-        tpl_max = tpl_box.maxPoint
-        base_cx = (tpl_min.x + tpl_max.x) * 0.5
-        base_cy = (tpl_min.y + tpl_max.y) * 0.5
-
-        # --- Auto-delete: only remove texts we previously generated (have our attribute) ---
-        for i in range(texts.count - 1, -1, -1):
-            t = texts.item(i)
-            if _is_generated(t):
-                t.deleteMe()
-
-        # --- Get template properties for new texts ---
-        height_param = template_text.heightParameter
-        text_height = height_param.value  # internal length (cm)
-        try:
-            template_angle = template_text.angle  # rotation in radians
-        except:
-            template_angle = 0.0
-        try:
-            template_font = template_text.fontName
-        except:
-            template_font = None
-
-        # Text alignment for creating new text
-        horiz_align = adsk.core.HorizontalAlignments.CenterHorizontalAlignment
-        vert_align = adsk.core.VerticalAlignments.MiddleVerticalAlignment
-
-        # --- For circular mode, calculate starting angle from template position ---
-        if is_circular:
-            # Vector from circle center to template text center
-            dx_from_center = base_cx - circle_center.x
-            dy_from_center = base_cy - circle_center.y
-            # Starting angle (where template is on the circle)
-            start_angle = math.atan2(dy_from_center, dx_from_center)
-
-        # --- Generate texts for segments 1..seg_count-1 ---
-        for i in range(1, seg_count):
-            n = start_number + i
-            label = str(n)
-
-            # Copy the template text
-            copy_coll = adsk.core.ObjectCollection.create()
-            copy_coll.add(template_text)
-            new_entities = sketch.copy(copy_coll, adsk.core.Matrix3D.create())
-            new_text = adsk.fusion.SketchText.cast(new_entities.item(0))
-
-            # Update the text content
-            new_text.textParameter.expression = f"'{label}'"
-            # Tag as generated so we can identify and delete it later
-            new_text.attributes.add(ATTR_GROUP, ATTR_NAME, label)
-
-            # Compute current center of copied text
-            nb = new_text.boundingBox
-            nmin = nb.minPoint
-            nmax = nb.maxPoint
-            cur_cx = (nmin.x + nmax.x) * 0.5
-            cur_cy = (nmin.y + nmax.y) * 0.5
-
-            if is_circular:
-                # Circular mode: position on circle and rotate
-                angle_offset = i * segment_angle
-                target_angle = start_angle + angle_offset
-
-                # Target position on circle
-                target_cx = circle_center.x + circle_radius * math.cos(target_angle)
-                target_cy = circle_center.y + circle_radius * math.sin(target_angle)
-
-                # Move to target position
-                dx = target_cx - cur_cx
-                dy = target_cy - cur_cy
-
-                xform = adsk.core.Matrix3D.create()
-                xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
-
-                coll = adsk.core.ObjectCollection.create()
-                coll.add(new_text)
-                sketch.move(coll, xform)
-
-                # Note: SketchText rotation via API doesn't work reliably.
-                # The text will be positioned correctly but not rotated.
-                # User should set template text orientation appropriately.
-            else:
-                # Linear mode: simple translation
-                step = i * pitch
-                target_cx = base_cx + step * dir_x
-                target_cy = base_cy + step * dir_y
-
-                dx = target_cx - cur_cx
-                dy = target_cy - cur_cy
-
-                xform = adsk.core.Matrix3D.create()
-                xform.translation = adsk.core.Vector3D.create(dx, dy, 0)
-
-                coll = adsk.core.ObjectCollection.create()
-                coll.add(new_text)
-                sketch.move(coll, xform)
-
-        # --- Create cuts and bodies if pcCutDepth is set ---
-        bodies_created = 0
-        profiles_in_text = 0
-        if cut_depth and cut_depth > 0:
-            # Make sure we're not in sketch edit mode - exit if needed
-            if app.activeEditObject and app.activeEditObject.classType == adsk.fusion.Sketch.classType:
-                sketch.isLightBulbOn = True  # Keep it visible
-                app.activeViewport.refresh()
-                design.rootComponent.activate()  # Exit sketch mode
-
-            # Delete previously generated extrude features
-            _delete_generated_features(design)
-
-            # Get the component containing the sketch
-            comp = sketch.parentComponent
-
-            # Collect all text positions and their numbers before exploding
-            # Store centroid for more reliable matching with rotated text
-            # Also calculate rotation angle for each position (for circular mode)
-            text_boxes = []
-            for i in range(texts.count):
-                t = texts.item(i)
-                bb = t.boundingBox
-                # Get the number from the text content
-                text_content = t.text
-                # Calculate centroid
-                cx = (bb.minPoint.x + bb.maxPoint.x) * 0.5
-                cy = (bb.minPoint.y + bb.maxPoint.y) * 0.5
-
-                # Calculate rotation angle for this text position (circular mode)
-                rotation_angle = 0.0
-                if is_circular:
-                    # Which segment is this? (0 = template, 1 = first generated, etc.)
-                    try:
-                        num_val = int(text_content)
-                        segment_idx = num_val - start_number
-                        rotation_angle = segment_idx * segment_angle
-                    except:
-                        pass
-
-                text_boxes.append({
-                    'min': bb.minPoint,
-                    'max': bb.maxPoint,
-                    'centroid': (cx, cy),
-                    'number': text_content,
-                    'rotation': rotation_angle
-                })
-
-            # Explode all texts to create actual curve profiles
-            # (Note: this is destructive - texts become curves)
-            texts_to_explode = []
-            for i in range(texts.count):
-                texts_to_explode.append(texts.item(i))
-
-            for t in texts_to_explode:
-                # Workaround for API bug: make a small edit first
-                try:
-                    t.textParameter.expression = t.textParameter.expression
-                except:
-                    pass
-                try:
-                    t.explode()
-                except:
-                    pass
-
-            # In circular mode, rotate curves by matching them to text positions
-            rotations_applied = 0
-            curves_to_delete = []  # Collect curves to delete after all rotations
-            if is_circular:
-                # First, delete all sketch constraints to allow free movement
-                try:
-                    constraints = sketch.geometricConstraints
-                    for i in range(constraints.count - 1, -1, -1):
-                        constraints.item(i).deleteMe()
-                except:
-                    pass
-
-                # Now collect all curves and group them by which text box they belong to
-                # based on their geometric center
-                for tb in text_boxes:
-                    if tb['rotation'] == 0.0:
-                        continue  # Skip template (no rotation needed)
-
-                    rot_cx, rot_cy = tb['centroid']
-                    rot_angle = tb['rotation']
-                    min_pt, max_pt = tb['min'], tb['max']
-
-                    # Find curves whose center is within this text's bounding box
-                    # Use a slightly expanded box for tolerance
-                    tol = 0.1
-                    curves_for_this_text = adsk.core.ObjectCollection.create()
-
-                    for i in range(sketch.sketchCurves.count):
-                        curve = sketch.sketchCurves.item(i)
-                        try:
-                            # Get curve's bounding box center
-                            bb = curve.boundingBox
-                            curve_cx = (bb.minPoint.x + bb.maxPoint.x) / 2
-                            curve_cy = (bb.minPoint.y + bb.maxPoint.y) / 2
-
-                            # Check if curve center is within text bounding box
-                            if (min_pt.x - tol <= curve_cx <= max_pt.x + tol and
-                                min_pt.y - tol <= curve_cy <= max_pt.y + tol):
-                                curves_for_this_text.add(curve)
-                        except:
-                            pass
-
-                    if curves_for_this_text.count > 0:
-                        rot_xform = adsk.core.Matrix3D.create()
-                        rot_xform.setToRotation(
-                            rot_angle,
-                            adsk.core.Vector3D.create(0, 0, 1),
-                            adsk.core.Point3D.create(rot_cx, rot_cy, 0)
-                        )
-                        try:
-                            # Copy with transform, then delete originals
-                            new_curves = sketch.copy(curves_for_this_text, rot_xform)
-                            if new_curves and new_curves.count > 0:
-                                # Collect curves to delete (store as list of entities)
-                                for j in range(curves_for_this_text.count):
-                                    curves_to_delete.append(curves_for_this_text.item(j))
-                                rotations_applied += 1
-                        except:
-                            pass
-
-                # Batch delete all original curves after rotations are done
-                for curve in curves_to_delete:
-                    try:
-                        curve.deleteMe()
-                    except:
-                        pass
-
-            # Recompute to ensure profiles are available
-            adsk.doEvents()
-
-            # Make guide circle construction geometry to exclude it from profiles
-            if is_circular and guide_circle_entity:
-                try:
-                    guide_circle_entity.isConstruction = True
-                except:
-                    pass
-
-            # First pass: collect all profile areas that are inside text bounding boxes
-            # to determine what a "normal" character area looks like
-            profile_areas = []
-            profiles = sketch.profiles
-
-            for i in range(profiles.count):
-                profile = profiles.item(i)
-                try:
-                    area_props = profile.areaProperties()
-                    centroid = area_props.centroid
-                    area = area_props.area
-                    cx, cy = centroid.x, centroid.y
-
-                    # Check if centroid is in any text box
-                    for (min_pt, max_pt) in text_boxes:
-                        if (min_pt.x <= cx <= max_pt.x and
-                            min_pt.y <= cy <= max_pt.y):
-                            profile_areas.append(area)
-                            break
-                except:
-                    pass
-
-            # Calculate threshold: median area * 3 should filter outliers (big boundary profiles)
-            if profile_areas:
-                sorted_areas = sorted(profile_areas)
-                median_area = sorted_areas[len(sorted_areas) // 2]
-                max_char_area = median_area * 3
-            else:
-                # Fallback: estimate based on text height and spacing
-                if is_circular:
-                    # Use arc length between segments as spacing estimate
-                    spacing = circle_radius * abs(segment_angle)
-                else:
-                    spacing = pitch
-                max_char_area = spacing * text_height * 2
-
-            # Get the guide circle entity (if in circular mode) to exclude from profiles
-            guide_circle = guide_circle_entity if is_circular else None
-
-            # Get guide circle properties for arc matching
-            guide_center = None
-            guide_radius_val = None
-            if guide_circle:
-                guide_center = guide_circle.centerSketchPoint.geometry
-                guide_radius_val = guide_circle.radius
-
-            # Helper to check if a profile contains excluded geometry
-            def has_excluded_curves(profile):
-                try:
-                    for loop in profile.profileLoops:
-                        for curve in loop.profileCurves:
-                            ent = curve.sketchEntity
-                            # Check if it's a projected entity (references external geometry)
-                            if hasattr(ent, 'isReference') and ent.isReference:
-                                return True
-                            # Check if it's construction geometry
-                            if hasattr(ent, 'isConstruction') and ent.isConstruction:
-                                return True
-                            # Check if it's the guide circle (in circular mode)
-                            if guide_circle and ent == guide_circle:
-                                return True
-                            # Check if it's an arc from the guide circle (when circle is split by text)
-                            if guide_center and guide_radius_val:
-                                arc = adsk.fusion.SketchArc.cast(ent)
-                                if arc:
-                                    arc_center = arc.centerSketchPoint.geometry
-                                    arc_radius = arc.radius
-                                    # Check if arc matches guide circle geometry (with tolerance)
-                                    center_dist = math.sqrt(
-                                        (arc_center.x - guide_center.x)**2 +
-                                        (arc_center.y - guide_center.y)**2
-                                    )
-                                    # Use 0.01 cm (0.1mm) tolerance
-                                    if center_dist < 0.01 and abs(arc_radius - guide_radius_val) < 0.01:
-                                        return True
-                except:
-                    pass
-                return False
-
-            # Collect valid text profiles with their bounding boxes
-            valid_profiles = []
-            profiles = sketch.profiles
-
-            for i in range(profiles.count):
-                profile = profiles.item(i)
-                try:
-                    # Skip profiles that contain projected or construction geometry
-                    if has_excluded_curves(profile):
-                        continue
-
-                    area_props = profile.areaProperties()
-                    centroid = area_props.centroid
-                    area = area_props.area
-                    cx, cy = centroid.x, centroid.y
-
-                    # Skip profiles that are too large (likely outer boundaries)
-                    if area > max_char_area:
-                        continue
-
-                    # Match profile to text - use distance for circular, bounding box for linear
-                    matched_number = None
-                    if is_circular:
-                        # For circular mode, find nearest text centroid
-                        best_dist = float('inf')
-                        for tb in text_boxes:
-                            tcx, tcy = tb['centroid']
-                            dist = math.sqrt((cx - tcx)**2 + (cy - tcy)**2)
-                            if dist < best_dist:
-                                best_dist = dist
-                                matched_number = tb['number']
-                        # Only accept if reasonably close (within text height)
-                        if best_dist > text_height * 2:
-                            matched_number = None
-                    else:
-                        # For linear mode, use bounding box containment
-                        for tb in text_boxes:
-                            min_pt, max_pt = tb['min'], tb['max']
-                            if (min_pt.x <= cx <= max_pt.x and
-                                min_pt.y <= cy <= max_pt.y):
-                                matched_number = tb['number']
-                                break
-
-                    if matched_number is not None:
-                        # Get profile bounding box
-                        bb = profile.boundingBox
-                        valid_profiles.append({
-                            'profile': profile,
-                            'area': area,
-                            'centroid': (cx, cy),
-                            'min': (bb.minPoint.x, bb.minPoint.y),
-                            'max': (bb.maxPoint.x, bb.maxPoint.y),
-                            'number': matched_number
-                        })
-                except:
-                    pass
-
-            # Filter out inner profiles (holes inside other profiles)
-            # A profile is an "inner hole" if its bounding box is fully contained within another profile's bounding box
-            def is_contained_in(inner, outer):
-                return (outer['min'][0] < inner['min'][0] and
-                        outer['min'][1] < inner['min'][1] and
-                        outer['max'][0] > inner['max'][0] and
-                        outer['max'][1] > inner['max'][1])
-
-            outer_profiles = []
-            for p in valid_profiles:
-                is_inner = False
-                for other in valid_profiles:
-                    if p is not other and is_contained_in(p, other):
-                        is_inner = True
-                        break
-                if not is_inner:
-                    outer_profiles.append(p)  # Keep full dict with number
-
-            profiles_in_text = len(outer_profiles)
-
-            if len(outer_profiles) == 0:
-                ui.messageBox(
-                    'PatternedCount:\n'
-                    'No valid text profiles found in sketch. Cannot create cuts/bodies.\n'
-                    'Ensure the sketch is on a face of an existing body.'
-                )
-            else:
-                extrudes = comp.features.extrudeFeatures
-                cuts_created = 0
-                cut_errors = []
-                body_errors = []
-
-                # Collect all outer profiles into an ObjectCollection for a single operation
-                # Also build a list of numbers in the same order
-                profile_collection = adsk.core.ObjectCollection.create()
-                profile_numbers = []
-                for p in outer_profiles:
-                    profile_collection.add(p['profile'])
-                    profile_numbers.append(p['number'])
-
-                # Create a single cut with all profiles
-                if profile_collection.count > 0:
-                    cut_input = extrudes.createInput(
-                        profile_collection,
-                        adsk.fusion.FeatureOperations.CutFeatureOperation
-                    )
-                    cut_distance = adsk.core.ValueInput.createByReal(-cut_depth)
-                    cut_input.setDistanceExtent(False, cut_distance)
-                    try:
-                        cut_feature = extrudes.add(cut_input)
-                        cut_feature.name = f"{GENERATED_PREFIX}cuts"
-                        cuts_created = profile_collection.count
-                    except Exception as e:
-                        cut_errors.append(str(e))
-
-                    # Create new bodies from the cut's end faces (bottom of pockets)
-                    if cuts_created > 0:
-                        try:
-                            # Get the end faces created by the cut
-                            end_faces = cut_feature.endFaces
-                            end_face_count = end_faces.count
-
-                            # Get sketch transform to convert model coords to sketch coords
-                            sketch_transform = sketch.transform
-                            sketch_transform_inv = sketch_transform.copy()
-                            sketch_transform_inv.invert()
-
-                            # Add small tolerance for centroid matching
-                            if is_circular:
-                                tol = circle_radius * abs(segment_angle) * 0.5
-                            else:
-                                tol = pitch * 0.5
-
-                            for j in range(end_face_count):
-                                face = end_faces.item(j)
-                                try:
-                                    # Find which number this face corresponds to by matching centroid to text boxes
-                                    face_centroid = face.centroid
-
-                                    # Transform face centroid from model space to sketch space
-                                    sketch_centroid = face_centroid.copy()
-                                    sketch_centroid.transformBy(sketch_transform_inv)
-                                    fcx, fcy = sketch_centroid.x, sketch_centroid.y
-
-                                    face_number = None
-                                    if is_circular:
-                                        # For circular mode, find nearest text centroid
-                                        best_dist = float('inf')
-                                        for tb in text_boxes:
-                                            tcx, tcy = tb['centroid']
-                                            dist = math.sqrt((fcx - tcx)**2 + (fcy - tcy)**2)
-                                            if dist < best_dist:
-                                                best_dist = dist
-                                                face_number = tb['number']
-                                        # Only accept if reasonably close
-                                        if best_dist > tol:
-                                            face_number = None
-                                    else:
-                                        # For linear mode, use bounding box with tolerance
-                                        for tb in text_boxes:
-                                            min_pt, max_pt = tb['min'], tb['max']
-                                            if (min_pt.x - tol <= fcx <= max_pt.x + tol and
-                                                min_pt.y - tol <= fcy <= max_pt.y + tol):
-                                                face_number = tb['number']
-                                                break
-
-                                    body_input = extrudes.createInput(
-                                        face,
-                                        adsk.fusion.FeatureOperations.NewBodyFeatureOperation
-                                    )
-                                    # Extrude up by cut_depth from the face
-                                    body_distance = adsk.core.ValueInput.createByReal(cut_depth)
-                                    body_input.setDistanceExtent(False, body_distance)
-                                    body_feature = extrudes.add(body_input)
-
-                                    # Name the feature (for timeline) with our prefix
-                                    body_feature.name = f"{GENERATED_PREFIX}body_{j}"
-
-                                    # Name only the newly created bodies (not existing ones)
-                                    # NewBodyFeatureOperation creates exactly one new body
-                                    if body_feature.bodies.count > 0:
-                                        new_body = body_feature.bodies.item(0)
-                                        if face_number is not None:
-                                            new_body.name = f"n{face_number}"
-
-                                    bodies_created += 1
-                                except Exception as e:
-                                    body_errors.append(f"Face {j}: {str(e)}")
-                        except Exception as e:
-                            body_errors.append(str(e))
-
-        # --- Report results ---
-        mode_str = "circular" if is_circular else "linear"
-        msg = f'PatternedCount ({mode_str}): Created {seg_count} numbers starting at {start_number}.'
-        if cut_depth and cut_depth > 0:
-            msg += f'\nCuts: {cuts_created}, Bodies: {bodies_created}'
-            if cut_errors:
-                msg += f'\nCut errors: {cut_errors[0]}'
-            if body_errors:
-                msg += f'\nBody errors: {body_errors[0]}'
-        ui.messageBox(msg)
-
-        # Group all timeline operations into one undo step (needs at least 2 features)
-        if timeline_start is not None:
-            timeline_end = timeline.markerPosition
-            if timeline_end - timeline_start >= 2:
-                try:
-                    timeline_group = timeline.timelineGroups.add(timeline_start, timeline_end - 1)
-                    timeline_group.name = "PatternedCount"
-                except:
-                    pass  # Grouping failed, not critical
-
+        _run_impl(app, ui)
     except Exception:
         if ui:
             ui.messageBox('PatternedCount failed:\n{}'.format(traceback.format_exc()))
 
 
 def stop(context):
-    # Called when the script/add-in is stopped
     pass

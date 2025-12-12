@@ -22,39 +22,6 @@ This is ideal for multi-material 3D printed projects where each digit needs its 
 - Can cut and create new bodies using `pcCutDepth`
 - Names all created bodies with numbers (`n0` for example)
 
-## User Parameters
-
-Create these parameters in **Modify → Change Parameters**.
-
-**Important:** Integer parameters must be created as **unitless** (leave the Unit field blank or select "No Unit"). Using a text parameter or adding units will cause errors.
-
-### Required Parameters
-
-| Name             | Type           | Description                                               |
-| ---------------- | -------------- | --------------------------------------------------------- |
-| `pcSegmentCount` | Unitless (int) | Number of segments (e.g., `10` for digits 0–9).           |
-| `pcStartNumber`  | Unitless (int) | First number in the sequence (e.g., `0`).                 |
-
-### Linear Mode Parameters
-
-| Name             | Type   | Description                                                      |
-| ---------------- | ------ | ---------------------------------------------------------------- |
-| `pcSegmentPitch` | Length | Center-to-center spacing between segments (e.g., `6 mm`).        |
-| `pcDirection`    | Text   | Direction to place numbers: `+X` (default), `-X`, `+Y`, or `-Y`. |
-
-### Circular Mode Parameters
-
-Circular mode is automatically enabled when the sketch contains a **guide circle**.
-
-| Name             | Type | Description                                              |
-| ---------------- | ---- | -------------------------------------------------------- |
-| `pcArcDirection` | Text | Direction around the circle: `CCW` (default) or `CW`.    |
-
-### Optional Parameters
-
-| Name          | Type   | Description                                                           |
-| ------------- | ------ | --------------------------------------------------------------------- |
-| `pcCutDepth`  | Length | If set, creates cuts and new bodies for each number (e.g., `0.4 mm`). |
 
 ## Usage
 
@@ -89,6 +56,41 @@ Circular mode is automatically enabled when the sketch contains a **guide circle
    - Create cuts and bodies if `pcCutDepth` is set
 
 Whenever you change parameters, simply run **PatternedCount** again.
+
+## User Parameters
+
+Create these parameters in **Modify → Change Parameters**.
+
+**Important:** Integer parameters must be created as **unitless** (leave the Unit field blank or select "No Unit"). Using a text parameter or adding units will cause errors.
+
+### Required Parameters
+
+| Name             | Type           | Description                                               |
+| ---------------- | -------------- | --------------------------------------------------------- |
+| `pcSegmentCount` | Unitless (int) | Number of segments (e.g., `10` for digits 0–9).           |
+| `pcStartNumber`  | Unitless (int) | First number in the sequence (e.g., `0`).                 |
+
+### Linear Mode Parameters
+
+| Name             | Type   | Description                                                      |
+| ---------------- | ------ | ---------------------------------------------------------------- |
+| `pcSegmentPitch` | Length | Center-to-center spacing between segments (e.g., `6 mm`).        |
+| `pcDirection`    | Text   | Direction to place numbers: `+X` (default), `-X`, `+Y`, or `-Y`. |
+
+### Circular Mode Parameters
+
+Circular mode is automatically enabled when the sketch contains a **guide circle**.
+
+| Name             | Type | Description                                              |
+| ---------------- | ---- | -------------------------------------------------------- |
+| `pcArcDirection` | Text | Direction around the circle: `CCW` (default) or `CW`.    |
+
+### Optional Parameters
+
+| Name          | Type   | Description                                                           |
+| ------------- | ------ | --------------------------------------------------------------------- |
+| `pcCutDepth`  | Length | If set, creates cuts and new bodies for each number (e.g., `0.4 mm`). |
+
 
 ## Notes
 
